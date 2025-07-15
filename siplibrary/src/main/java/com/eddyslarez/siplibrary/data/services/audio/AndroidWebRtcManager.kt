@@ -148,10 +148,15 @@ class AndroidWebRtcManager(
             // Add local audio track
             addLocalAudioTrack()
             
-            // Create offer
+            // Configurar constraints más específicos para SIP
             val constraints = MediaConstraints().apply {
                 mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"))
                 mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
+                // Configuraciones adicionales para compatibilidad SIP
+                mandatory.add(MediaConstraints.KeyValuePair("IceRestart", "false"))
+                mandatory.add(MediaConstraints.KeyValuePair("VoiceActivityDetection", "true"))
+                // Opcional: Deshabilitar BUNDLE si causa problemas
+                optional.add(MediaConstraints.KeyValuePair("googUseRtpMUX", "true"))
             }
             
             val offer = suspendCancellableCoroutine<SessionDescription> { continuation ->
@@ -186,7 +191,10 @@ class AndroidWebRtcManager(
             }
             
             log.d(tag = TAG) { "Offer created successfully" }
-            return@withContext offer.description
+            
+            // Procesar SDP para compatibilidad SIP si es necesario
+            val processedSdp = processSdpForSipCompatibility(offer.description)
+            return@withContext processedSdp
             
         } catch (e: Exception) {
             log.e(tag = TAG) { "Error creating offer: ${e.message}" }
@@ -205,16 +213,23 @@ class AndroidWebRtcManager(
                 createPeerConnection()
             }
             
-            // Set remote description (offer)
-            setRemoteDescription(offerSdp, SdpType.OFFER)
+            // Procesar SDP entrante para compatibilidad
+            val processedOfferSdp = processSdpForSipCompatibility(offerSdp)
+            log.d(tag = TAG) { "Processed offer SDP length: ${processedOfferSdp.length}" }
+            
+            // Set remote description (offer) con SDP procesado
+            setRemoteDescription(processedOfferSdp, SdpType.OFFER)
             
             // Add local audio track
             addLocalAudioTrack()
             
-            // Create answer
+            // Configurar constraints para answer
             val constraints = MediaConstraints().apply {
                 mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"))
                 mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
+                // Configuraciones específicas para answer
+                mandatory.add(MediaConstraints.KeyValuePair("VoiceActivityDetection", "true"))
+                optional.add(MediaConstraints.KeyValuePair("googUseRtpMUX", "true"))
             }
             
             val answer = suspendCancellableCoroutine<SessionDescription> { continuation ->
@@ -249,7 +264,10 @@ class AndroidWebRtcManager(
             }
             
             log.d(tag = TAG) { "Answer created successfully" }
-            return@withContext answer.description
+            
+            // Procesar SDP de respuesta para compatibilidad SIP
+            val processedAnswerSdp = processSdpForSipCompatibility(answer.description)
+            return@withContext processedAnswerSdp
             
         } catch (e: Exception) {
             log.e(tag = TAG) { "Error creating answer: ${e.message}" }
@@ -263,9 +281,13 @@ class AndroidWebRtcManager(
         try {
             log.d(tag = TAG) { "Setting remote description: $type" }
             
+            // Procesar SDP para compatibilidad antes de aplicar
+            val processedSdp = processSdpForSipCompatibility(sdp)
+            log.d(tag = TAG) { "Original SDP length: ${sdp.length}, Processed: ${processedSdp.length}" }
+            
             val sessionDescription = SessionDescription(
                 if (type == SdpType.OFFER) SessionDescription.Type.OFFER else SessionDescription.Type.ANSWER,
-                sdp
+                processedSdp
             )
             
             suspendCancellableCoroutine<Unit> { continuation ->
@@ -301,6 +323,95 @@ class AndroidWebRtcManager(
             
         } catch (e: Exception) {
             log.e(tag = TAG) { "Error adding ICE candidate: ${e.message}" }
+        }
+    }
+
+    /**
+     * Procesa el SDP para mejorar la compatibilidad con servidores SIP
+     */
+    private fun processSdpForSipCompatibility(originalSdp: String): String {
+        try {
+            var processedSdp = originalSdp
+            
+            // 1. Agregar grupo BUNDLE si no existe y hay múltiples medios
+            if (!processedSdp.contains("a=group:BUNDLE") && processedSdp.contains("m=audio")) {
+                val mediaLines = mutableListOf<String>()
+                val lines = processedSdp.split("\r\n")
+                
+                lines.forEach { line ->
+                    if (line.startsWith("m=")) {
+                        // Extraer el identificador del medio (generalmente el primer token después de m=)
+                        val parts = line.split(" ")
+                        if (parts.size > 0) {
+                            val mediaType = parts[0].substring(2) // Remover "m="
+                            mediaLines.add(mediaType)
+                        }
+                    }
+                }
+                
+                if (mediaLines.isNotEmpty()) {
+                    // Insertar línea BUNDLE después de la línea v=
+                    val versionIndex = processedSdp.indexOf("v=0")
+                    if (versionIndex != -1) {
+                        val insertIndex = processedSdp.indexOf("\r\n", versionIndex) + 2
+                        val bundleLine = "a=group:BUNDLE ${mediaLines.joinToString(" ")}\r\n"
+                        processedSdp = processedSdp.substring(0, insertIndex) + 
+                                     bundleLine + 
+                                     processedSdp.substring(insertIndex)
+                    }
+                }
+            }
+            
+            // 2. Asegurar que hay mid attributes para cada medio
+            val lines = processedSdp.split("\r\n").toMutableList()
+            var currentMediaIndex = -1
+            var mediaCount = 0
+            
+            for (i in lines.indices) {
+                val line = lines[i]
+                
+                if (line.startsWith("m=")) {
+                    currentMediaIndex = i
+                    mediaCount++
+                    
+                    // Buscar si ya existe a=mid después de esta línea m=
+                    var hasMid = false
+                    for (j in (i + 1) until lines.size) {
+                        if (lines[j].startsWith("m=")) break
+                        if (lines[j].startsWith("a=mid:")) {
+                            hasMid = true
+                            break
+                        }
+                    }
+                    
+                    // Si no tiene mid, agregarlo
+                    if (!hasMid) {
+                        val mediaType = if (line.startsWith("m=audio")) "audio" else "video"
+                        val midLine = "a=mid:$mediaType$mediaCount"
+                        lines.add(i + 1, midLine)
+                    }
+                }
+            }
+            
+            processedSdp = lines.joinToString("\r\n")
+            
+            // 3. Limpiar líneas duplicadas o problemáticas
+            processedSdp = processedSdp.replace(Regex("a=group:BUNDLE.*\r\na=group:BUNDLE.*\r\n"), 
+                                              processedSdp.substringAfter("a=group:BUNDLE").substringBefore("\r\n").let { 
+                                                  "a=group:BUNDLE$it\r\n" 
+                                              })
+            
+            // 4. Asegurar formato correcto de líneas
+            processedSdp = processedSdp.replace("\n", "\r\n")
+                                     .replace("\r\r\n", "\r\n")
+            
+            log.d(tag = TAG) { "SDP processing completed successfully" }
+            return processedSdp
+            
+        } catch (e: Exception) {
+            log.e(tag = TAG) { "Error processing SDP: ${e.message}" }
+            // En caso de error, devolver el SDP original
+            return originalSdp
         }
     }
 
@@ -559,6 +670,9 @@ class AndroidWebRtcManager(
         return@withContext try {
             log.d(tag = TAG) { "Applying modified SDP" }
             
+            // Procesar SDP modificado para compatibilidad
+            val processedSdp = processSdpForSipCompatibility(modifiedSdp)
+            
             val sessionDescription = SessionDescription(SessionDescription.Type.OFFER, modifiedSdp)
             
             suspendCancellableCoroutine<Unit> { continuation ->
@@ -568,6 +682,7 @@ class AndroidWebRtcManager(
                     }
                     
                     override fun onSetFailure(error: String) {
+                        log.e(tag = TAG) { "Failed to apply modified SDP: $error" }
                         continuation.resumeWithException(Exception("Failed to apply modified SDP: $error"))
                     }
                     
@@ -681,11 +796,23 @@ class AndroidWebRtcManager(
         try {
             log.d(tag = TAG) { "Creating peer connection" }
             
-            val rtcConfig = PeerConnection.RTCConfiguration(emptyList()).apply {
-                bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
+            // Configuración más flexible para compatibilidad SIP
+            val iceServers = listOf(
+                PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer()
+            )
+            
+            val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
+                // Cambiar a BALANCED para mejor compatibilidad con SIP
+                bundlePolicy = PeerConnection.BundlePolicy.BALANCED
                 rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
-                tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.DISABLED
+                // Permitir TCP para mejor compatibilidad
+                tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.ENABLED
                 continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+                // Configuraciones adicionales para SIP
+                iceConnectionReceivingTimeout = 30000
+                iceBackupCandidatePairPingInterval = 25000
+                keyType = PeerConnection.KeyType.ECDSA
+                sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             }
             
             peerConnection = peerConnectionFactory?.createPeerConnection(
@@ -748,11 +875,21 @@ class AndroidWebRtcManager(
             
             log.d(tag = TAG) { "Adding local audio track" }
             
-            // Create audio source
+            // Configurar constraints de audio más específicos para SIP
             val audioConstraints = MediaConstraints().apply {
+                // Configuraciones básicas
                 mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation", "true"))
                 mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "true"))
                 mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "true"))
+                
+                // Configuraciones adicionales para mejor calidad de voz
+                mandatory.add(MediaConstraints.KeyValuePair("googHighpassFilter", "true"))
+                mandatory.add(MediaConstraints.KeyValuePair("googTypingNoiseDetection", "true"))
+                mandatory.add(MediaConstraints.KeyValuePair("googAudioMirroring", "false"))
+                
+                // Configuraciones opcionales
+                optional.add(MediaConstraints.KeyValuePair("googNoiseSuppression2", "true"))
+                optional.add(MediaConstraints.KeyValuePair("googEchoCancellation2", "true"))
             }
             
             audioSource = peerConnectionFactory?.createAudioSource(audioConstraints)
