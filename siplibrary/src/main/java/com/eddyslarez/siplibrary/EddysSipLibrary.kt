@@ -15,6 +15,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
+import com.eddyslarez.siplibrary.data.services.audio.AndroidWebRtcManager
 
 /**
  * EddysSipLibrary - Biblioteca SIP/VoIP para Android (Versión Optimizada)
@@ -196,7 +197,10 @@ class EddysSipLibrary private constructor() {
             // Inicializar traducción si está habilitada
             if (config.enableTranslation && config.openAiApiKey != null) {
                 translationIntegration = TranslationIntegration(application)
-                translationIntegration?.initialize(config.openAiApiKey, config.defaultLanguage)
+                
+                // Obtener referencia al WebRTC manager para integración
+                val webRtcManager = sipCoreManager?.webRtcManager as? AndroidWebRtcManager
+                translationIntegration?.initialize(config.openAiApiKey, config.defaultLanguage, webRtcManager)
                 setupTranslationCallbacks()
             }
 
@@ -684,6 +688,26 @@ class EddysSipLibrary private constructor() {
     }
     
     /**
+     * Iniciar traducción para la llamada actual
+     */
+    fun startTranslationForCurrentCall(): Boolean {
+        checkInitialized()
+        val callData = sipCoreManager?.currentAccountInfo?.currentCallData ?: return false
+        val translationInfo = translationIntegration?.currentCallTranslationInfo?.value ?: return false
+        
+        translationIntegration?.startTranslationForCall(callData, translationInfo)
+        return true
+    }
+    
+    /**
+     * Detener traducción para la llamada actual
+     */
+    fun stopTranslationForCurrentCall() {
+        checkInitialized()
+        translationIntegration?.stopTranslationForCall()
+    }
+    
+    /**
      * Obtener información de traducción de la llamada actual
      */
     fun getCurrentTranslationInfo(): CallTranslationInfo? {
@@ -697,6 +721,14 @@ class EddysSipLibrary private constructor() {
     fun isTranslationActive(): Boolean {
         checkInitialized()
         return translationIntegration?.isTranslationActive?.value ?: false
+    }
+    
+    /**
+     * Obtener diagnóstico de traducción
+     */
+    fun getTranslationDiagnostic(): String {
+        checkInitialized()
+        return translationIntegration?.getDiagnosticInfo() ?: "Translation not initialized"
     }
 
     /**
@@ -897,7 +929,14 @@ class EddysSipLibrary private constructor() {
 
     fun getSystemHealthReport(): String {
         checkInitialized()
-        return sipCoreManager?.getSystemHealthReport() ?: "Library not initialized"
+        return buildString {
+            appendLine(sipCoreManager?.getSystemHealthReport() ?: "Library not initialized")
+            
+            if (config.enableTranslation) {
+                appendLine("\n=== TRANSLATION SYSTEM ===")
+                appendLine(getTranslationDiagnostic())
+            }
+        }
     }
 
     fun isSystemHealthy(): Boolean {

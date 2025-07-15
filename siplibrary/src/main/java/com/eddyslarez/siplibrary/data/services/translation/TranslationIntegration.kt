@@ -3,6 +3,7 @@ package com.eddyslarez.siplibrary.data.services.translation
 import android.Manifest
 import android.app.Application
 import androidx.annotation.RequiresPermission
+import com.eddyslarez.siplibrary.data.services.audio.AndroidWebRtcManager
 import com.eddyslarez.siplibrary.data.models.AccountInfo
 import com.eddyslarez.siplibrary.data.models.CallData
 import com.eddyslarez.siplibrary.data.models.CallDirections
@@ -27,6 +28,9 @@ class TranslationIntegration(
     private val realtimeTranslationManager = RealtimeTranslationManager(application)
     private val audioProcessor = TranslationAudioProcessor()
     
+    // Referencia al WebRTC manager para integración de audio
+    private var webRtcManager: AndroidWebRtcManager? = null
+    
     // Estados
     private val _isTranslationActive = MutableStateFlow(false)
     val isTranslationActive: StateFlow<Boolean> = _isTranslationActive.asStateFlow()
@@ -46,9 +50,10 @@ class TranslationIntegration(
      * Inicializar la integración de traducción
      */
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
-    fun initialize(openAiApiKey: String, defaultLanguage: String = "es") {
+    fun initialize(openAiApiKey: String, defaultLanguage: String = "es", webRtcManager: AndroidWebRtcManager? = null) {
         this.openAiApiKey = openAiApiKey
         this.localLanguage = defaultLanguage
+        this.webRtcManager = webRtcManager
         
         realtimeTranslationManager.initialize(openAiApiKey)
         audioProcessor.initialize()
@@ -62,10 +67,20 @@ class TranslationIntegration(
      * Configurar callbacks internos
      */
     private fun setupCallbacks() {
-        // Callback para audio capturado
-        audioProcessor.setAudioInputCallback { audioData ->
-            if (_isTranslationActive.value) {
-                realtimeTranslationManager.sendAudioForTranslation(audioData)
+        // Configurar integración con WebRTC si está disponible
+        webRtcManager?.let { manager ->
+            // Habilitar captura de audio desde WebRTC
+            manager.enableTranslation { audioData ->
+                if (_isTranslationActive.value) {
+                    realtimeTranslationManager.sendAudioForTranslation(audioData)
+                }
+            }
+        } ?: run {
+            // Fallback: usar procesador de audio independiente
+            audioProcessor.setAudioInputCallback { audioData ->
+                if (_isTranslationActive.value) {
+                    realtimeTranslationManager.sendAudioForTranslation(audioData)
+                }
             }
         }
         
@@ -85,8 +100,9 @@ class TranslationIntegration(
             }
             
             override fun onTranslatedAudioReceived(audioData: ByteArray) {
-                // Reproducir audio traducido
-                audioProcessor.playTranslatedAudio(audioData)
+                // Reproducir audio traducido a través de WebRTC o procesador independiente
+                webRtcManager?.playTranslatedAudio(audioData) 
+                    ?: audioProcessor.playTranslatedAudio(audioData)
             }
             
             override fun onTranslationCompleted() {
@@ -239,8 +255,14 @@ class TranslationIntegration(
         // Habilitar traducción
         realtimeTranslationManager.setTranslationEnabled(true)
         
-        // Iniciar captura de audio
-        audioProcessor.startAudioCapture()
+        // Iniciar captura de audio según el método disponible
+        if (webRtcManager?.isTranslationEnabled() == false) {
+            webRtcManager?.enableTranslation { audioData ->
+                realtimeTranslationManager.sendAudioForTranslation(audioData)
+            }
+        } else {
+            audioProcessor.startAudioCapture()
+        }
         
         _isTranslationActive.value = true
         
@@ -253,9 +275,11 @@ class TranslationIntegration(
     fun stopTranslationForCall() {
         _isTranslationActive.value = false
         
-        // Detener captura de audio
-        audioProcessor.stopAudioCapture()
-        audioProcessor.stopAudioPlayback()
+        // Detener captura de audio según el método usado
+        webRtcManager?.disableTranslation() ?: run {
+            audioProcessor.stopAudioCapture()
+            audioProcessor.stopAudioPlayback()
+        }
         
         // Deshabilitar traducción
         realtimeTranslationManager.setTranslationEnabled(false)
@@ -287,6 +311,8 @@ class TranslationIntegration(
             appendLine("Local Language: $localLanguage")
             appendLine("Translation State: $translationState")
             appendLine("OpenAI API Key Set: ${openAiApiKey != null}")
+            appendLine("WebRTC Integration: ${webRtcManager != null}")
+            appendLine("WebRTC Translation Enabled: ${webRtcManager?.isTranslationEnabled() ?: false}")
             
             appendLine("\n--- Current Call Translation ---")
             if (currentInfo != null) {
@@ -304,6 +330,12 @@ class TranslationIntegration(
             appendLine("Sample Rate: ${audioStats.sampleRate}")
             appendLine("Input Buffer: ${audioStats.inputBufferSize}")
             appendLine("Output Buffer: ${audioStats.outputBufferSize}")
+            
+            // Información de WebRTC si está disponible
+            webRtcManager?.let { manager ->
+                appendLine("\n--- WebRTC Audio Integration ---")
+                appendLine(manager.diagnoseAudioIssues())
+            }
         }
     }
     
@@ -312,11 +344,13 @@ class TranslationIntegration(
      */
     fun dispose() {
         stopTranslationForCall()
+        webRtcManager?.disableTranslation()
         audioProcessor.dispose()
         realtimeTranslationManager.dispose()
         
         _currentCallTranslationInfo.value = null
         translationStatusCallback = null
+        webRtcManager = null
         
         log.d(tag = TAG) { "Translation integration disposed" }
     }
